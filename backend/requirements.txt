@@ -1,0 +1,6 @@
+Django>=4.2,<5.0
+djangorestframework>=3.15
+numpy>=1.26
+scipy>=1.11
+# Production database driver (PostgreSQL + PostGIS):
+psycopg2-binary>=2.9
