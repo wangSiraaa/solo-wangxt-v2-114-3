@@ -69,6 +69,42 @@ VERSION_STATUS_CHOICES = [
     (VERSION_SUPERSEDED, "Superseded by a newer confirmed version"),
 ]
 
+# Sampling-frame revision lifecycle. A resurveyed boundary NEVER overwrites
+# the already-published frame in place: every edition of boundary + declared
+# area + CRS statement is its own immutable row, and estimates pin the frame
+# edition they were expanded against.
+FRAME_DRAFT = "draft"
+FRAME_REVIEWED = "reviewed"
+FRAME_PUBLISHED = "published"
+FRAME_SUPERSEDED = "superseded"
+FRAME_STATUS_CHOICES = [
+    (FRAME_DRAFT, "Draft — resurveyed boundary under check"),
+    (FRAME_REVIEWED, "Reviewed — human QA done, awaiting publication"),
+    (FRAME_PUBLISHED, "Published — the current sampling frame; immutable"),
+    (FRAME_SUPERSEDED,
+     "Superseded — a previously published edition, retained as history"),
+]
+
+# Blocking findings raised while checking a proposed frame. Each one is a
+# work item that MUST be resolved by a human before publication; the system
+# never publishes past them silently.
+ISSUE_EXCLUDED_TREE = "excluded_tree"
+ISSUE_AREA_MISMATCH = "area_mismatch"
+ISSUE_OVERLAP = "overlap"
+ISSUE_CRS = "crs_mismatch"
+FRAME_ISSUE_KIND_CHOICES = [
+    (ISSUE_EXCLUDED_TREE, "New boundary excludes an existing stem position"),
+    (ISSUE_AREA_MISMATCH, "Declared area vs polygon area beyond tolerance"),
+    (ISSUE_OVERLAP, "Overlaps another plot of the same stratum"),
+    (ISSUE_CRS, "CRS statement differs from the station survey CRS"),
+]
+ISSUE_OPEN = "open"
+ISSUE_RESOLVED = "resolved"
+FRAME_ISSUE_STATUS_CHOICES = [
+    (ISSUE_OPEN, "Open — blocks publication"),
+    (ISSUE_RESOLVED, "Resolved by a documented human decision"),
+]
+
 
 class Stratum(models.Model):
     """Sampling stratum with known land area (the sampling frame)."""
@@ -282,6 +318,18 @@ class TreeMeasurement(models.Model):
 
     notes = models.CharField(max_length=240, blank=True)
 
+    # Frame edition in force WHEN this observation was collected. Set at
+    # ingest from the plot's then-published frame (null for pre-frame
+    # history). A newly published boundary never mutates this value: the
+    # measurement keeps belonging to the boundary it was taken under — it is
+    # never migrated, deleted or rewritten by a revision.
+    collected_frame = models.ForeignKey(
+        "PlotFrameRevision", on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="measurements_collected",
+        help_text="Published frame edition in force when this was observed.",
+    )
+
     class Meta:
         unique_together = [("tree", "campaign")]
         ordering = ["tree__plot__code", "tree__current_field_number"]
@@ -362,6 +410,13 @@ class EstimateVersion(models.Model):
         Campaign, on_delete=models.PROTECT, related_name="estimate_t2"
     )
     equations = models.ManyToManyField(AllometricEquation, related_name="estimates")
+    # The exact sampling-frame edition per plot this run was expanded
+    # against. An estimate can NEVER be run without pinning frame editions:
+    # the per-hectare expansion uses the area recorded on that edition.
+    frames = models.ManyToManyField(
+        "PlotFrameRevision", related_name="estimates",
+        help_text="Plot frame editions this estimate is explicitly bound to.",
+    )
     status = models.CharField(
         max_length=12, choices=VERSION_STATUS_CHOICES, default=VERSION_DRAFT
     )
@@ -392,3 +447,196 @@ class EstimateVersion(models.Model):
 
     def __str__(self):
         return f"{self.label} [{self.status}]"
+
+
+class PlotFrameRevision(models.Model):
+    """
+    One edition of a plot's sampling-frame statement.
+
+    Each resurvey produces a NEW row carrying boundary ring, declared area
+    and an explicit CRS statement. The lifecycle is draft -> reviewed ->
+    published; published rows are frozen (and at most one published edition
+    may exist per plot — a newer publication supersedes the older one rather
+    than editing it).
+
+    Important non-effects of publication:
+      * the already-published frame of OTHER plots never changes;
+      * historical TreeMeasurement rows keep ``collected_frame`` pointing at
+        the boundary they were taken under — never migrated or rewritten;
+      * an EstimateVersion is bound to explicit frame editions, so a
+        confirmed estimate keeps expanding with the areas it was run on.
+
+    A proposed edition that excludes existing stems, whose declared area
+    disagrees with its polygon beyond tolerance, or whose polygon overlaps a
+    same-stratum plot carries open FrameRevisionIssues and cannot be
+    published until a human resolves each one.
+    """
+
+    plot = models.ForeignKey(
+        Plot, on_delete=models.PROTECT, related_name="frame_revisions"
+    )
+    revision_no = models.PositiveIntegerField(
+        help_text="1-based edition number per plot."
+    )
+    status = models.CharField(
+        max_length=10, choices=FRAME_STATUS_CHOICES, default=FRAME_DRAFT
+    )
+    # Proposed resurvey values. Declared area is the station's (possibly
+    # corrected) declaration; polygon area is computed from the ring and the
+    # two are cross-checked, never silently substituted for each other.
+    declared_area_ha = models.FloatField()
+    boundary = models.JSONField(
+        help_text="Proposed boundary ring [[x_m, y_m], ...] in crs_epsg."
+    )
+    polygon_area_ha = models.FloatField(
+        help_text="Shoelace area of boundary in ha at draft creation."
+    )
+    area_check = models.JSONField(
+        default=dict,
+        help_text="Area cross-check result: declared/polygon/relative diff/"
+                  "tolerance/passed.",
+    )
+    crs_epsg = models.IntegerField(
+        help_text="Explicit CRS statement for this resurvey (EPSG code)."
+    )
+    crs_note = models.CharField(
+        max_length=240, blank=True,
+        help_text="Surveyor/CRS explanation travelling with this edition.",
+    )
+    geometry_checksum = models.CharField(
+        max_length=64,
+        help_text="SHA-256 of the canonical proposed ring. Identifies same "
+                  "geometry across editions (old/new comparison).",
+    )
+    content_checksum = models.CharField(
+        max_length=64,
+        help_text="SHA-256 of ring + declared area + CRS statement. An "
+                  "identical re-upload is idempotent (returns this edition); "
+                  "a same-ring area/CRS correction is a NEW edition.",
+    )
+    reason = models.CharField(
+        max_length=400, blank=True,
+        help_text="Why this revision exists (boundary resurvey reason)."
+    )
+    validation_payload = models.JSONField(
+        default=dict,
+        help_text="Full check output: area, CRS, excluded stems, overlaps.",
+    )
+    # The frame edition this edition would supersede when published.
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="superseded_by",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.CharField(max_length=400, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+    publication_reason = models.CharField(
+        max_length=400, blank=True,
+        help_text="Mandatory documented reason for publication.",
+    )
+
+    class Meta:
+        ordering = ["plot__code", "-revision_no"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["plot", "revision_no"],
+                name="frame_revision_no_unique_per_plot",
+            ),
+            # Re-uploading the same geometry + same area/CRS statement must
+            # find — and only ever find — one edition. A same-ring but
+            # different declared area or CRS is a distinct revision.
+            models.UniqueConstraint(
+                fields=["plot", "content_checksum"],
+                name="frame_content_checksum_unique_per_plot",
+            ),
+            # At most one published edition per plot. Enforced in the DB so
+            # two racing publish requests cannot both succeed.
+            models.UniqueConstraint(
+                fields=["plot"],
+                condition=models.Q(status=FRAME_PUBLISHED),
+                name="frame_one_published_per_plot",
+            ),
+        ]
+
+    _FROZEN_STATUSES = (FRAME_PUBLISHED, FRAME_SUPERSEDED)
+
+    def save(self, *args, _frame_system=False, **kwargs):
+        if self.pk:
+            original = type(self).objects.get(pk=self.pk)
+            if original.status in self._FROZEN_STATUSES:
+                immutable = (
+                    "declared_area_ha", "boundary", "polygon_area_ha",
+                    "area_check", "crs_epsg", "crs_note", "geometry_checksum",
+                    "content_checksum", "reason", "validation_payload",
+                    "supersedes_id",
+                )
+                changed = [f for f in immutable
+                           if getattr(original, f) != getattr(self, f)]
+                # The ONLY legal movement of a published row is the frame
+                # workflow retiring it to "superseded" during publication of
+                # a newer edition (system transition, content untouched).
+                allowed_transition = (
+                    _frame_system
+                    and original.status == FRAME_PUBLISHED
+                    and self.status == FRAME_SUPERSEDED
+                    and not changed
+                )
+                if changed or not allowed_transition:
+                    raise PermissionError(
+                        f"PlotFrameRevision {self.plot.code} "
+                        f"v{self.revision_no} is {original.status} and "
+                        f"immutable; illegal changes "
+                        f"{changed or ['status']}. Publish a new revision "
+                        "instead."
+                    )
+        super().save(*args, **kwargs)
+
+    @property
+    def has_open_blocking_issues(self):
+        return self.issues.filter(status=ISSUE_OPEN).exists()
+
+    def __str__(self):
+        return f"{self.plot.code} frame v{self.revision_no} [{self.status}]"
+
+
+class FrameRevisionIssue(models.Model):
+    """
+    A blocking finding on a proposed frame edition.
+
+    Issues are raised at draft creation / re-validation and persist as
+    auditable work items. Every OPEN issue blocks publication; a documented
+    human decision (resolve note) is the only way past one — publication
+    never recomputes them away.
+    """
+
+    revision = models.ForeignKey(
+        PlotFrameRevision, on_delete=models.CASCADE, related_name="issues"
+    )
+    kind = models.CharField(max_length=20, choices=FRAME_ISSUE_KIND_CHOICES)
+    detail = models.JSONField(
+        default=dict,
+        help_text="Structured finding (tree label/coords, areas, other "
+                  "plot code, overlap fraction, CRS codes…).",
+    )
+    summary = models.CharField(max_length=400)
+    status = models.CharField(
+        max_length=10, choices=FRAME_ISSUE_STATUS_CHOICES, default=ISSUE_OPEN
+    )
+    resolution_note = models.CharField(max_length=400, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            # One work item per finding target on an edition (re-runs of
+            # validation upsert rather than duplicating).
+            models.UniqueConstraint(
+                fields=["revision", "kind", "summary"],
+                name="frame_issue_unique_per_revision_kind_target",
+            ),
+        ]
+
+    def __str__(self):
+        return f"v{self.revision_id} {self.kind}: {self.summary[:40]}"

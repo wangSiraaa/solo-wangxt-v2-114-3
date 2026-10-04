@@ -15,5 +15,13 @@ router.register("measurements", views.MeasurementViewSet,
 router.register("conflicts", views.ConflictViewSet, basename="conflict")
 router.register("imports", views.ImportViewSet, basename="import")
 router.register("estimates", views.EstimateViewSet, basename="estimate")
+router.register("frame-revisions", views.FrameRevisionViewSet,
+                basename="frame-revision")
+frame_issue_resolve = views.FrameIssueResolveView.as_view(
+    {"post": "resolve"})
 
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("", include(router.urls)),
+    path("frame-issues/<int:pk>/resolve/", frame_issue_resolve,
+         name="frame-issue-resolve"),
+]

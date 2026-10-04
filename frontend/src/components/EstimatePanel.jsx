@@ -179,6 +179,43 @@ function EditionDetail({ v }) {
               Object.entries(r.design.strata).map(([k, s]) =>
                 [k, { area_ha: s.area_ha, plots: s.plot_codes }]))
           }, null, 2)}</pre>
+          <h4>Sampling-frame edition this estimate is bound to</h4>
+          <p className="hint">
+            Per-hectare expansion uses the area of these explicit frame
+            editions. A newer boundary publication refreshes drafts but can
+            never change a confirmed edition's numbers.
+          </p>
+          <table className="frame-table">
+            <thead><tr><th>plot</th><th>frame edition</th><th>status</th>
+            <th>expansion area (ha)</th></tr></thead>
+            <tbody>
+              {(v.frames || []).map((f) => (
+                <tr key={f.id}>
+                  <td>{f.plot_code}</td>
+                  <td>v{f.revision_no}</td>
+                  <td className={`status-${f.status}`}>{f.status}</td>
+                  <td>{f.declared_area_ha}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {(r.provenance.plots || []).some(
+              (p) => (p.historical_observations_on_older_frame || []).length)
+            && (
+            <div className="frame-impact">
+              <strong>Observations collected under older frame editions:</strong>
+              {r.provenance.plots.filter(
+                (p) => (p.historical_observations_on_older_frame || []).length
+              ).map((p) => (
+                <div key={p.plot}>
+                  {p.plot}: expanded against v{p.frame_revision_no};{" "}
+                  {p.historical_observations_on_older_frame.map(
+                    (o) => `${o.tree} (v${o.collected_frame_revision})`
+                  ).join(", ")}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div>
           <h4>Provenance / data quality</h4>
@@ -195,7 +232,8 @@ function EditionDetail({ v }) {
             <summary>per-plot sources</summary>
             {r.provenance.plots.map((p) => (
               <div key={p.plot} className="plot-prov">
-                <strong>{p.plot}</strong> ({p.area_ha} ha, {p.stratum}):
+                <strong>{p.plot}</strong> ({p.area_ha} ha, {p.stratum},
+                {" "}frame v{p.frame_revision_no ?? "?"}):
                 {" "}growth {p.kg.survivor_growth} kg ·
                 mortality {p.mortality.map((m) => m.tree).join(", ") || "—"} ·
                 ingrowth {p.ingrowth.map((m) => m.tree).join(", ") || "—"}

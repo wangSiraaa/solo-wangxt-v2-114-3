@@ -61,8 +61,18 @@ def biomass_measurement_variance(agb, dbh_cm, height_m, eq,
 
 
 # --------------------------------------------------------------- table build
-def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
-    """Returns (table_rows, equations_by_species, plots, strata)."""
+def build_measurement_table(t1_campaign, t2_campaign, equations_qs,
+                            frames=None):
+    """
+    Returns (table_rows, equations_by_species, plots, strata).
+
+    ``frames`` is an optional {plot_code: PlotFrameRevision} mapping. When
+    given, every plot's expansion area and boundary come from THAT edition —
+    an estimate is always expanded against the sampling-frame edition it is
+    bound to, never from a mutable Plot row. Measurement rows additionally
+    carry the frame edition in force when each observation was collected,
+    so historical measurements visibly stay on their original boundary.
+    """
     equations = {}
     for e in equations_qs:
         for sp in e.species.all():
@@ -84,11 +94,17 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
         strata[s.code] = {"code": s.code, "name": s.name,
                           "area_ha": s.area_ha, "plot_codes": []}
     for p in Plot.objects.select_related("stratum"):
+        frame = frames.get(p.code) if frames is not None else None
         plots[p.code] = {
             "code": p.code,
             "stratum": p.stratum.code,
-            "area_ha": p.declared_area_ha,
+            # Explicit frame binding: expansion uses the EDITION's area.
+            "area_ha": frame.declared_area_ha if frame else p.declared_area_ha,
             "x_m": p.x_m, "y_m": p.y_m,
+            "boundary": frame.boundary if frame else p.boundary,
+            "frame_revision_id": frame.id if frame else None,
+            "frame_revision_no": frame.revision_no if frame else None,
+            "frame_status": frame.status if frame else None,
         }
         strata[p.stratum.code]["plot_codes"].append(p.code)
 
@@ -99,7 +115,7 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
             TreeMeasurement.objects
             .filter(campaign=campaign)
             .select_related("tree", "tree__plot", "tree__species",
-                            "tree__superseded_tree")
+                            "tree__superseded_tree", "collected_frame")
         )
         for m in qs:
             out.append({
@@ -111,6 +127,11 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
                 "status": m.status,
                 "dbh_cm": m.dbh_cm,
                 "height_m": m.height_m,
+                # The observation belongs to the boundary it was collected
+                # under; a new frame never rewrites this attribution.
+                "collected_frame_revision": (
+                    m.collected_frame.revision_no
+                    if m.collected_frame_id else None),
                 "verified_renumber_of": (
                     m.tree.superseded_tree_id
                     if campaign == t2_campaign
@@ -136,7 +157,7 @@ def resolved_identity_pairs(t1_campaign, t2_campaign):
         elif c.status == CONFLICT_DISTINCT:
             distinct.add(key)
     # field-book verified renumber links carried on the tree itself
-    from inventory.models import Tree, TreeMeasurement
+    from inventory.models import TreeMeasurement
     for m2 in (TreeMeasurement.objects
                .filter(campaign=t2_campaign)
                .select_related("tree")):
@@ -160,6 +181,13 @@ class PlotComponents:
     code: str
     stratum: str
     area_ha: float
+    frame_revision_id: object = None
+    frame_revision_no: object = None
+    frame_status: object = None
+    # Historical observations that were collected under a DIFFERENT frame
+    # edition than the one this run is expanded against. They keep their
+    # original boundary attribution; listed for provenance, never migrated.
+    legacy_frame_observations: list = None
     survivor_kg: float = 0.0
     survivor_var_meas_kg2: float = 0.0
     survivor_observed_pairs: int = 0
@@ -186,7 +214,8 @@ class PlotComponents:
     stock_t2_resid_var: float = 0.0
 
     def __post_init__(self):
-        for f in ("survivor_zero_growth", "survivor_missing", "mortality_ids",
+        for f in ("legacy_frame_observations", "survivor_zero_growth",
+                  "survivor_missing", "mortality_ids",
                   "ingrowth_ids", "below_recruitment_ids", "missing_tree_ids",
                   "extrapolation_ids", "equation_missing_input_ids",
                   "excluded_conflict_ids"):
@@ -209,8 +238,33 @@ def _extrapolates(row, eq):
 def compute_plot_components(plot_code, plot_info, pairing, equations,
                             dbh_sd_cm, height_sd_m, zero_tol_cm,
                             recruitment_cm, interval_years):
-    pc = PlotComponents(code=plot_code, stratum=plot_info["stratum"],
-                        area_ha=plot_info["area_ha"])
+    pc = PlotComponents(
+        code=plot_code, stratum=plot_info["stratum"],
+        area_ha=plot_info["area_ha"],
+        frame_revision_id=plot_info.get("frame_revision_id"),
+        frame_revision_no=plot_info.get("frame_revision_no"),
+        frame_status=plot_info.get("frame_status"),
+    )
+
+    # Historical observations collected under an older boundary edition.
+    # They remain on that original boundary (no migration); this run simply
+    # lists them as part of the plot's frame provenance.
+    current_no = plot_info.get("frame_revision_no")
+    if current_no is not None:
+        seen = set()
+        for pair in pairing["pairs"]:
+            for r in (pair["t1"], pair["t2"]):
+                if r["plot"] != plot_code:
+                    continue
+                fno = r.get("collected_frame_revision")
+                if fno is not None and fno != current_no \
+                        and r["tree_id"] not in seen:
+                    seen.add(r["tree_id"])
+                    pc.legacy_frame_observations.append({
+                        "tree": f"{plot_code}/{r['field_number']}",
+                        "collected_frame_revision": fno,
+                        "expanded_against_revision": current_no,
+                    })
 
     def agb(row):
         eq = equations[row["species"]]
@@ -647,6 +701,10 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
 def _pc_provenance(pc):
     return {
         "plot": pc.code, "stratum": pc.stratum, "area_ha": pc.area_ha,
+        "frame_revision_id": pc.frame_revision_id,
+        "frame_revision_no": pc.frame_revision_no,
+        "frame_status": pc.frame_status,
+        "historical_observations_on_older_frame": pc.legacy_frame_observations,
         "survivor_observed_pairs": pc.survivor_observed_pairs,
         "verified_zero_growth": pc.survivor_zero_growth,
         "alive_not_measured": pc.survivor_missing,

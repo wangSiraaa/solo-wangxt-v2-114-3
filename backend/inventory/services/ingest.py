@@ -35,6 +35,19 @@ from inventory.services.units import (
 @transaction.atomic
 def import_campaign_rows(campaign, rows, area_tolerance):
     accepted, rejected = [], []
+    # New observations are collected under the frame edition currently in
+    # force for each plot. Historical rows keep their own collected_frame;
+    # a later boundary revision never rewrites them.
+    from inventory.services.frames import latest_published_frame
+    current_frames = {}
+
+    def frame_for(plot):
+        if plot is None:
+            return None
+        if plot.id not in current_frames:
+            current_frames[plot.id] = latest_published_frame(plot)
+        return current_frames[plot.id]
+
     for raw in rows:
         reason = _validate_row(raw)
         plot = Plot.objects.filter(code=raw["plot"]).first()
@@ -131,7 +144,7 @@ def import_campaign_rows(campaign, rows, area_tolerance):
             else:
                 tree = reuse
 
-        TreeMeasurement.objects.update_or_create(
+        measurement, meas_created = TreeMeasurement.objects.update_or_create(
             tree=tree, campaign=campaign,
             defaults={
                 "field_number_seen": raw["field_number"],
@@ -146,6 +159,10 @@ def import_campaign_rows(campaign, rows, area_tolerance):
                 "notes": raw.get("notes", ""),
             },
         )
+        if meas_created:
+            # Attribution to the frame in force at collection time only.
+            measurement.collected_frame = frame_for(plot)
+            measurement.save(update_fields=["collected_frame"])
         accepted.append({"tree_id": tree.id, "field_number": raw["field_number"],
                          "plot": plot.code, "renumber": superseded is not None})
 

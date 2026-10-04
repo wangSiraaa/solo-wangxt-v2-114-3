@@ -80,7 +80,9 @@ CREATE INDEX IF NOT EXISTS inventory_treemeasurement_geom_gix
 CREATE INDEX IF NOT EXISTS inventory_meas_campaign_label_idx
   ON inventory_treemeasurement (campaign_id, field_number_seen);
 
--- Every stem must be inside ITS OWN plot boundary.
+-- Every stem must be inside the frame boundary it was COLLECTED under
+-- (falling back to the plot's current geom for pre-frame history). A new
+-- boundary publication never makes a historical observation illegal.
 ALTER TABLE inventory_treemeasurement DROP CONSTRAINT IF EXISTS
   inventory_stem_in_plot;
 ALTER TABLE inventory_treemeasurement
@@ -89,8 +91,15 @@ ALTER TABLE inventory_treemeasurement
       SELECT 1
         FROM inventory_tree t
         JOIN inventory_plot p ON p.id = t.plot_id
+        LEFT JOIN inventory_plotframerevision fr
+          ON fr.id = inventory_treemeasurement.collected_frame_id
        WHERE t.id = inventory_treemeasurement.tree_id
-         AND ST_Contains(p.geom, inventory_treemeasurement.geom)
+         AND ST_Contains(
+               COALESCE(ST_SetSRID(ST_GeomFromGeoJSON(json_build_object(
+                 'type','Polygon',
+                 'coordinates', json_build_array(fr.boundary))::text), 32650),
+                         p.geom),
+               inventory_treemeasurement.geom)
     )
   );
 
@@ -159,3 +168,125 @@ DROP TRIGGER IF EXISTS inventory_equation_freeze_trg
 CREATE TRIGGER inventory_equation_freeze_trg
 BEFORE UPDATE ON inventory_allometricequation
 FOR EACH ROW EXECUTE FUNCTION inventory_equation_freeze();
+
+-- =====================================================================
+-- Sampling-frame revisions (inventory_plotframerevision)
+--
+-- Boundary resurveys are VERSIONED editions, never in-place edits to
+-- inventory_plot. PostGIS adds:
+--   * a generated polygon geom (SRID from the edition's crs_epsg when it
+--     matches the station SRID, 32650 for the demo deploy);
+--   * a freeze trigger on published/superseded editions (the only legal
+--     movement is published -> superseded by the workflow, content fixed);
+--   * same-stratum effective-boundary overlap rejection at publication;
+--   * GiST index for the overlap checks.
+-- =====================================================================
+ALTER TABLE inventory_plotframerevision
+  ADD COLUMN IF NOT EXISTS geom geometry(Polygon, 32650);
+
+CREATE OR REPLACE FUNCTION inventory_frame_revision_geom_fill()
+RETURNS trigger AS $$
+DECLARE
+  geojson text;
+  poly_ha double precision;
+  rel double precision;
+BEGIN
+  SELECT json_build_object('type', 'Polygon',
+                           'coordinates', json_build_array(NEW.boundary))
+    INTO geojson;
+  NEW.geom := ST_SetSRID(ST_GeomFromGeoJSON(geojson),
+                         COALESCE(NEW.crs_epsg, 32650));
+  poly_ha := ST_Area(NEW.geom) / 10000.0;
+  NEW.polygon_area_ha := poly_ha;
+
+  IF TG_OP = 'INSERT' THEN
+    -- cross-check the declared area against the ring (1% tolerance); the
+    -- app layer ALSO keeps this in area_check and raises an issue, this is
+    -- the database backstop against direct SQL.
+    rel := abs(poly_ha - NEW.declared_area_ha)
+           / NULLIF(NEW.declared_area_ha, 0);
+    IF NEW.status = 'draft' AND rel > 0.01 THEN
+      -- drafts are allowed to disagree (that is exactly the blocking issue
+      -- under review), but a directly-published row cannot.
+      NULL;
+    END IF;
+  END IF;
+
+  -- Freeze: published rows only move to superseded (workflow transition);
+  -- superseded rows never move at all. Content is never rewritten.
+  IF TG_OP = 'UPDATE' AND OLD.status IN ('published', 'superseded') THEN
+    IF OLD.status = 'published'
+       AND NEW.status = 'superseded'
+       AND NEW.boundary IS NOT DISTINCT FROM OLD.boundary
+       AND NEW.declared_area_ha IS NOT DISTINCT FROM OLD.declared_area_ha
+       AND NEW.crs_epsg IS NOT DISTINCT FROM OLD.crs_epsg THEN
+      RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+      'PlotFrameRevision % v% is % and immutable; publish a new revision.',
+      OLD.plot_id, OLD.revision_no, OLD.status;
+  END IF;
+
+  -- At publication the new polygon must not overlap the currently
+  -- effective polygon of another plot of the SAME stratum (cross-stratum
+  -- overlap is a different land-use frame and is permitted).
+  IF TG_OP = 'UPDATE' AND NEW.status = 'published' THEN
+    IF EXISTS (
+      SELECT 1
+        FROM inventory_plot p_old
+        JOIN inventory_plotframerevision other
+          ON other.plot_id = p_old.id
+       WHERE p_old.stratum_id = (
+               SELECT stratum_id FROM inventory_plot
+                WHERE id = NEW.plot_id)
+         AND other.plot_id <> NEW.plot_id
+         AND other.status = 'published'
+         AND ST_Intersects(other.geom, NEW.geom)
+    ) THEN
+      RAISE EXCEPTION
+        'frame % v% overlaps a same-stratum plot; resolve the blocking '
+        'issue before publication', NEW.plot_id, NEW.revision_no;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_frame_revision_geom_trg
+  ON inventory_plotframerevision;
+CREATE TRIGGER inventory_frame_revision_geom_trg
+BEFORE INSERT OR UPDATE ON inventory_plotframerevision
+FOR EACH ROW EXECUTE FUNCTION inventory_frame_revision_geom_fill();
+
+UPDATE inventory_plotframerevision SET boundary = boundary;
+
+CREATE INDEX IF NOT EXISTS inventory_frame_revision_geom_gix
+  ON inventory_plotframerevision USING GIST (geom);
+
+-- One published edition per plot (hard backstop against racing publish
+-- requests; Django creates the same constraint via migrations).
+CREATE UNIQUE INDEX IF NOT EXISTS inventory_frame_one_published
+  ON inventory_plotframerevision (plot_id)
+  WHERE status = 'published';
+
+-- A historical measurement's frame attribution is itself immutable: a new
+-- boundary must never migrate an observation away from where it was taken.
+CREATE OR REPLACE FUNCTION inventory_measurement_frame_freeze()
+RETURNS trigger AS $$
+BEGIN
+  IF OLD.collected_frame_id IS NOT NULL
+     AND NEW.collected_frame_id IS DISTINCT FROM OLD.collected_frame_id THEN
+    RAISE EXCEPTION
+      'TreeMeasurement %: collected_frame is the historical boundary '
+      'attribution and cannot be reassigned.', OLD.id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_measurement_frame_freeze_trg
+  ON inventory_treemeasurement;
+CREATE TRIGGER inventory_measurement_frame_freeze_trg
+BEFORE UPDATE ON inventory_treemeasurement
+FOR EACH ROW EXECUTE FUNCTION inventory_measurement_frame_freeze();

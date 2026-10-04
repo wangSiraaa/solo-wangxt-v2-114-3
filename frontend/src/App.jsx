@@ -17,18 +17,25 @@ export default function App() {
   const [m2, setM2] = useState([]);
   const [selectedPlot, setSelectedPlot] = useState(null);
   const [conflicts, setConflicts] = useState([]);
+  const [revisions, setRevisions] = useState([]);
+  const [boundaryView, setBoundaryView] = useState("current");
   const [error, setError] = useState("");
 
   async function refreshConflicts() {
     setConflicts(await api.conflicts("open"));
   }
+  async function refreshRevisions() {
+    setRevisions(await api.frameRevisions());
+  }
 
   useEffect(() => {
     (async () => {
       try {
-        const [ps, cs] = await Promise.all([api.plots(), api.campaigns()]);
+        const [ps, cs, rs] = await Promise.all([
+          api.plots(), api.campaigns(), api.frameRevisions()]);
         setPlots(ps);
         setCampaigns(cs);
+        setRevisions(rs);
         const ordered = [...cs].sort((a, b) =>
           a.measured_on.localeCompare(b.measured_on));
         if (ordered.length >= 2) {
@@ -54,8 +61,10 @@ export default function App() {
 
   const ctx = useMemo(() => ({
     plots, campaigns, t1, t2, m1, m2, conflicts,
-    setSelectedPlot, refreshConflicts,
-  }), [plots, campaigns, t1, t2, m1, m2, conflicts]);
+    revisions, boundaryView, setBoundaryView,
+    setSelectedPlot, refreshConflicts, refreshRevisions,
+  }), [plots, campaigns, t1, t2, m1, m2, conflicts, revisions,
+       boundaryView]);
 
   return (
     <div className="app">

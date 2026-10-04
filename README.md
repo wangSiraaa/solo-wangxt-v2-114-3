@@ -71,6 +71,28 @@ Y = Σ_h Y_h，SE 跨层合成（Welch–Satterthwaite 自由度，t 分布 95% 
 * 确认时同时**锁定所用方程**（系数不可改）；新系数必须以**新方程 code/version** 录入，
   并产生**新版本估计**，旧版本数字永不改变。
 
+### 1.7 样地抽样框修订（边界重测不重写已发布抽样框）
+重测后的边界、申报面积和 CRS 说明是**独立的版本行** `PlotFrameRevision`，生命周期
+`draft → reviewed → published`：
+
+* **原始边界、面积核对结果、CRS 说明、评审/发布原因全部保留**。发布行不可变；新版发布时
+  旧版转为 `superseded`（历史仍可读），`Plot` 当前边界在同一事务内推进。
+* 估计**显式绑定抽样框版本**（M2M + 设计快照中的 frames 块）：每公顷扩展只用所绑定版本的
+  面积。历史 `TreeMeasurement` 带 `collected_frame`，永远归属采集时的边界——新边界
+  **不自动迁移、删除或改写**任何观测。
+* 新边界若（a）排除既有树位、（b）申报面积与多边形面积超过 1% 容差、（c）与**同层**样地
+  多边形重叠、（d）CRS 声明与本站投影 CRS 不符，会生成持久化的 `FrameRevisionIssue`
+  待处理项并**阻止发布**；系统不会悄悄重算或绕过。每个问题只能由**带书面说明的人工决定**
+  解决。
+* 发布是**原子事务**：推进当前边界的同时，把该样地所有 draft 估计在同一事务内按新版
+  重新扩展；任何一步失败整体回滚，**不会留下半发布边界或错误估计**。confirmed 估计
+  冻结在原绑定版本上，永不刷新。
+* 同一几何+面积+CRS 重复上传**幂等返回同一修订**；同环但更正面积/CRS 是新版本。
+  数据库部分唯一索引（每样地至多一个 published）保证两个发布请求竞争时**只产生一个
+  published 版本**，败者保持 reviewed（409）。
+* 提供发布、**新旧比较**和**影响查询** API；地图、样地详情和估计来源可切换查看当前 /
+  新 / 旧边界，并高亮被排除、新纳入及仍在旧版本上的个体。
+
 ---
 
 ## 2. 不确定性假设（结果中完整输出）
@@ -114,10 +136,13 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 ```
 
 界面三页：
-1. **Plots & individuals**：SVG 地图显示全部样地边界与 t2 个体状态；点入样地看 t1→t2 复测、
-   改号、零生长/缺测/死亡着色；
+1. **Plots & individuals**：SVG 地图显示全部样地边界与 t2 个体状态；可在**当前 / 新 / 旧
+   抽样框边界**间切换，被新边界排除的树位以紫色圆环标记；点入样地看 t1→t2 复测、
+   改号、零生长/缺测/死亡着色，并在**样地抽样框修订工作台**上传重测边界、处理待处理项、
+   评审与发布、查看影响个体；
 2. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct）；
-3. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结。
+3. **Estimates**：选择方程→跑 draft（自动绑定当前 published 框架版本）→查看分量、来源、
+   不确定性及**框架版本绑定**→确认冻结。
 
 ---
 
@@ -130,9 +155,17 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 | GET | `/api/conflicts/?status=open` | 同号位置矛盾 |
 | POST | `/api/conflicts/{id}/resolve/` | `{status: renumber|distinct, note}` |
 | POST | `/api/imports/` | 批量入库（拒收单位错误/越界行，207 返回明细） |
-| POST | `/api/estimates/` | 运行 draft 估计 |
+| POST | `/api/estimates/` | 运行 draft 估计（自动绑定当前 published 框架版本） |
 | POST | `/api/estimates/{id}/confirm/` | 冻结版本并锁定方程 |
-| GET | `/api/estimates/{id}/` | 完整结果：分量 + 来源 + 不确定性 |
+| GET | `/api/estimates/{id}/` | 完整结果：分量 + 来源 + 不确定性 + 框架绑定 |
+| GET | `/api/frame-revisions/?plot=P01` | 某样地全部框架版本（draft/reviewed/published/superseded） |
+| POST | `/api/frame-revisions/` | 上传重测边界→校验→draft（同内容幂等） |
+| POST | `/api/frame-revisions/{id}/revalidate/` | 重新执行几何/面积/重叠/树位校验 |
+| POST | `/api/frame-revisions/{id}/submit_review/` | draft → reviewed（QA 备注必填） |
+| POST | `/api/frame-revisions/{id}/publish/` | reviewed → published（发布原因必填，带待处理项则 422） |
+| GET | `/api/frame-revisions/{id}/compare/` | 新旧边界、面积、CRS 差异 |
+| GET | `/api/frame-revisions/{id}/impact/` | 受影响个体（被排除/新纳入）、待处理项、可否发布 |
+| POST | `/api/frame-issues/{id}/resolve/` | 书面人工决定关闭一个阻止发布的待处理项 |
 
 ### 入库行示例
 ```json
@@ -154,8 +187,20 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 ```bash
 cd backend && python3 manage.py test inventory
 ```
-12 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
-不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫。
+23 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
+不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫，
+以及**样地抽样框修订**：
+
+* 合格的面积修订只改变新 draft 的每公顷扩展（0.10→0.20 ha 新 draft 总量减半），旧
+  confirmed 数字逐字节不变；
+* 排除历史树位 / 面积超容差 / 同层重叠的修订生成 open 待处理项并**阻止发布**，人工书面
+  解决后才能发布，历史观测不迁移、不删除；
+* 同一几何重复上传幂等返回同一修订，同环改面积产生新版本；
+* 两个发布请求竞争（文件级 sqlite + 线程，子进程隔离）只产生一个 published 版本，败者
+  保持 reviewed；
+* 校验失败或上传坏几何后**没有半发布边界、没有错误估计、没有残留 draft 行**；
+* 发布在同一事务内刷新既有 draft 估计；新观测记入新版框架、历史观测保持 v1 归属；
+* compare / impact / 发布 / 评审 / 幂等全部通过 API 验收。
 
 ## 6. 虚构演示数据场景索引
 * `P01/004` 两次胸径相同 → **真实零生长**；

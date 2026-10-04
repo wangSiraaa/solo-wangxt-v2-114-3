@@ -31,4 +31,19 @@ export const api = {
   estimate: (id) => get(`/estimates/${id}/`),
   createEstimate: (payload) => post("/estimates/", payload),
   confirmEstimate: (id) => post(`/estimates/${id}/confirm/`),
+
+  // sampling-frame revisions
+  frameRevisions: (plot) =>
+    get(`/frame-revisions/${plot ? `?plot=${encodeURIComponent(plot)}` : ""}`),
+  frameRevision: (id) => get(`/frame-revisions/${id}/`),
+  createFrameRevision: (payload) => post("/frame-revisions/", payload),
+  revalidateFrame: (id) => post(`/frame-revisions/${id}/revalidate/`),
+  submitFrameReview: (id, review_note) =>
+    post(`/frame-revisions/${id}/submit_review/`, { review_note }),
+  publishFrame: (id, publication_reason) =>
+    post(`/frame-revisions/${id}/publish/`, { publication_reason }),
+  compareFrame: (id) => get(`/frame-revisions/${id}/compare/`),
+  impactFrame: (id) => get(`/frame-revisions/${id}/impact/`),
+  resolveFrameIssue: (id, resolution_note) =>
+    post(`/frame-issues/${id}/resolve/`, { resolution_note }),
 };

@@ -9,6 +9,17 @@ POST /imports/                      ingest a campaign's field rows
 POST /estimates/                    run (or rerun) a DRAFT estimate
 POST /estimates/{id}/confirm/       freeze forever; locks equations
 GET  /estimates/{id}/               frozen result with provenance
+
+Sampling-frame revision (boundary resurvey; old published frame preserved):
+GET  /frame-revisions/                          editions (+ ?plot=, ?status=)
+POST /frame-revisions/                         upload resurvey -> draft
+GET  /frame-revisions/{id}/                    edition + blocking issues
+POST /frame-revisions/{id}/revalidate/         re-run geometry checks
+POST /frame-revisions/{id}/submit_review/      draft -> reviewed (QA note)
+POST /frame-revisions/{id}/publish/            reviewed -> published
+GET  /frame-revisions/{id}/compare/            old vs new boundary + issues
+GET  /frame-revisions/{id}/impact/             affected historical stems
+POST /frame-issues/{id}/resolve/               documented human resolution
 """
 import hashlib
 
@@ -22,12 +33,13 @@ from rest_framework.response import Response
 from inventory.models import (
     AllometricEquation,
     Campaign,
-    CONFLICT_DISTINCT,
     CONFLICT_OPEN,
     CONFLICT_RENUMBER,
     EstimateVersion,
+    FrameRevisionIssue,
     IdentityConflict,
     Plot,
+    PlotFrameRevision,
     Species,
     Stratum,
     Tree,
@@ -40,6 +52,11 @@ from inventory.serializers import (
     ConflictSerializer,
     EquationSerializer,
     EstimateVersionSerializer,
+    FramePublishSerializer,
+    FrameRevisionCreateSerializer,
+    FrameReviewSerializer,
+    FrameRevisionIssueResolveSerializer,
+    PlotFrameRevisionSerializer,
     MeasurementImportSerializer,
     MeasurementSerializer,
     PlotSerializer,
@@ -48,11 +65,21 @@ from inventory.serializers import (
     TreeSerializer,
 )
 from inventory.services.conflicts import scan_conflicts
-from inventory.services.estimator import (
-    build_measurement_table,
-    estimate,
-    equation_checksum,
-    resolved_identity_pairs,
+from inventory.services.estimator import equation_checksum
+from inventory.services.estimates_run import (
+    assert_version_frames_current,
+    run_draft_estimate,
+)
+from inventory.services.frames import (
+    FrameBlockedError,
+    FrameWorkflowError,
+    compare_frames,
+    create_or_get_revision,
+    frame_impact,
+    publish_revision,
+    resolve_issue,
+    revalidate_revision,
+    submit_for_review,
 )
 from inventory.services.ingest import import_campaign_rows
 
@@ -78,7 +105,8 @@ class EquationViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class PlotViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Plot.objects.select_related("stratum").all()
+    queryset = Plot.objects.select_related("stratum").prefetch_related(
+        "frame_revisions__issues")
     serializer_class = PlotSerializer
 
 
@@ -192,7 +220,9 @@ class EstimateViewSet(viewsets.ViewSet):
         """
         Body: {"label": ..., "t1_campaign": CODE, "t2_campaign": CODE,
                "equation_ids": [...], "fpc": true}
-        Creates (or recomputes) a DRAFT. Confirmation is a separate action.
+        Creates (or recomputes) a DRAFT. The draft is explicitly bound to
+        the currently published frame edition of every plot. Confirmation
+        is a separate action.
         """
         label = request.data.get("label", "draft estimate")
         t1 = Campaign.objects.filter(
@@ -211,49 +241,13 @@ class EstimateViewSet(viewsets.ViewSet):
             return Response({"detail": "equation_ids invalid/empty"},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        table_t1, table_t2, equations, plots, strata = (
-            build_measurement_table(t1, t2, equations_qs)
-        )
-        uncovered = sorted({
-            r["species"] for r in table_t1 + table_t2
-            if r["species"] not in equations
-        })
-        renumber, distinct = resolved_identity_pairs(t1, t2)
-
-        interval = round(
-            (t2.measured_on - t1.measured_on).days / 365.25, 3)
-        design = {
-            "t1_code": t1.code, "t2_code": t2.code,
-            "interval_years": interval,
-            "dbh_sd_cm": settings.DBH_MEASUREMENT_SD_CM,
-            "height_sd_m": settings.HEIGHT_MEASUREMENT_SD_M,
-            "zero_tol_cm": settings.ZERO_GROWTH_TOL_CM,
-            "recruitment_cm": settings.RECRUITMENT_DBH_CM,
-            "fpc": bool(request.data.get("fpc", True)),
-            "crs_epsg": settings.SURVEY_CRS_EPSG,
-        }
-        result = estimate(table_t1, table_t2, equations, plots, strata,
-                          design,
-                          resolved_renumber_pairs=renumber,
-                          resolved_distinct_pairs=distinct)
-        result["species_without_equation"] = uncovered
-        checksum = equation_checksum(equations)
-
-        snap_strata = {code: {**s, "plot_codes": list(s["plot_codes"])}
-                       for code, s in strata.items()}
-        design_snapshot = {**design,
-                           "strata": snap_strata,
-                           "equation_ids": sorted(eq_ids),
-                           "equation_codes": {sp: e["code"] + "@" + e["version"]
-                                              for sp, e in equations.items()},
-                           "area_tolerance": settings.PLOT_AREA_TOLERANCE}
-
-        version = EstimateVersion.objects.create(
-            label=label, t1_campaign=t1, t2_campaign=t2,
-            design_snapshot=design_snapshot,
-            result_payload=result, equation_checksum=checksum,
-        )
-        version.equations.set(equations_qs)
+        try:
+            version = run_draft_estimate(
+                label=label, t1=t1, t2=t2, equations_qs=equations_qs,
+                fpc=bool(request.data.get("fpc", True)))
+        except Exception as exc:  # validation must not leave a draft behind
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
         return Response(EstimateVersionSerializer(version).data,
                         status=status.HTTP_201_CREATED)
 
@@ -264,9 +258,17 @@ class EstimateViewSet(viewsets.ViewSet):
         if version.status == VERSION_CONFIRMED:
             return Response({"detail": "already confirmed"},
                             status=status.HTTP_409_CONFLICT)
+        # The frame binding must be current: a frame published AFTER this
+        # draft was last refreshed refreshes drafts in the same publishing
+        # transaction, so this should only fire for concurrent staleness.
+        if not assert_version_frames_current(version):
+            return Response(
+                {"detail": "this draft is bound to a superseded frame "
+                           "edition; re-run the draft against the current "
+                           "frame before confirming."},
+                status=status.HTTP_409_CONFLICT)
         with transaction.atomic():
             # re-verify checksum: equations must not have drifted since run
-            from inventory.services.estimator import build_measurement_table
             eqs = version.equations.all().prefetch_related("species")
             equations = {}
             for e in eqs:
@@ -300,4 +302,145 @@ class EstimateViewSet(viewsets.ViewSet):
 def _get_version(pk):
     from django.shortcuts import get_object_or_404
     return get_object_or_404(
-        EstimateVersion.objects.prefetch_related("equations"), pk=pk)
+        EstimateVersion.objects.prefetch_related("equations", "frames",
+                                                 "frames__plot"), pk=pk)
+
+
+def _get_revision(pk):
+    from django.shortcuts import get_object_or_404
+    return get_object_or_404(
+        PlotFrameRevision.objects.select_related("plot")
+        .prefetch_related("issues"), pk=pk)
+
+
+def _frame_error_response(exc, http_status=status.HTTP_409_CONFLICT):
+    payload = {"detail": str(exc)}
+    issues = getattr(exc, "issues", None)
+    if issues:
+        payload["blocking_issues"] = [
+            {"id": i.id, "kind": i.kind, "summary": i.summary}
+            for i in issues]
+    return Response(payload, status=http_status)
+
+
+class FrameRevisionViewSet(viewsets.ViewSet):
+    """
+    Sampling-frame editions: draft -> reviewed -> published.
+
+    Every resurvey is a NEW immutable edition; the already-published frame
+    (and confirmed estimates bound to it) is never rewritten. Editions that
+    exclude stems, fail the area cross-check or overlap a same-stratum plot
+    carry open blocking issues and cannot be published.
+    """
+
+    def list(self, request):
+        qs = (PlotFrameRevision.objects
+              .select_related("plot").prefetch_related("issues")
+              .order_by("plot__code", "-revision_no"))
+        plot = request.query_params.get("plot")
+        if plot:
+            qs = qs.filter(plot__code=plot)
+        st = request.query_params.get("status")
+        if st:
+            qs = qs.filter(status=st)
+        return Response(
+            PlotFrameRevisionSerializer(qs, many=True).data)
+
+    def retrieve(self, request, pk=None):
+        return Response(PlotFrameRevisionSerializer(_get_revision(pk)).data)
+
+    def create(self, request):
+        ser = FrameRevisionCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+        plot_code = (request.data.get("plot")
+                     or request.parser_context["kwargs"].get("plot"))
+        plot = Plot.objects.filter(code=plot_code).first()
+        if plot is None:
+            return Response({"detail": f"unknown plot {plot_code!r}"},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            revision, created = create_or_get_revision(
+                plot, boundary=v["boundary"],
+                declared_area_ha=v["declared_area_ha"],
+                crs_epsg=v["crs_epsg"], crs_note=v.get("crs_note", ""),
+                reason=v.get("reason", ""))
+        except Exception as exc:
+            # Invalid geometry/area: nothing is persisted, no half-edition.
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        data = PlotFrameRevisionSerializer(revision).data
+        # Idempotent upload: identical content returns the SAME revision.
+        return Response(data, status=(status.HTTP_201_CREATED if created
+                                      else status.HTTP_200_OK))
+
+    @action(detail=True, methods=["post"])
+    def revalidate(self, request, pk=None):
+        revision = _get_revision(pk)
+        try:
+            payload = revalidate_revision(revision)
+        except FrameWorkflowError as exc:
+            return _frame_error_response(exc)
+        revision.refresh_from_db()
+        data = PlotFrameRevisionSerializer(revision).data
+        data["latest_validation"] = payload
+        return Response(data)
+
+    @action(detail=True, methods=["post"], url_path="submit_review")
+    def submit_review(self, request, pk=None):
+        revision = _get_revision(pk)
+        ser = FrameReviewSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            revision = submit_for_review(revision, ser.validated_data
+                                         ["review_note"])
+        except FrameWorkflowError as exc:
+            return _frame_error_response(exc)
+        return Response(PlotFrameRevisionSerializer(revision).data)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        """
+        reviewed -> published. Atomic with Plot update and draft-estimate
+        refresh; two racing publish calls can produce only ONE published
+        edition (DB unique constraint), the loser gets 409.
+        """
+        revision = _get_revision(pk)
+        ser = FramePublishSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            revision, refreshed = publish_revision(
+                revision, ser.validated_data["publication_reason"])
+        except FrameBlockedError as exc:
+            return _frame_error_response(exc, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except FrameWorkflowError as exc:
+            return _frame_error_response(exc, status.HTTP_409_CONFLICT)
+        data = PlotFrameRevisionSerializer(revision).data
+        data["refreshed_draft_estimate_ids"] = refreshed
+        return Response(data)
+
+    @action(detail=True, methods=["get"])
+    def compare(self, request, pk=None):
+        return Response(compare_frames(_get_revision(pk)))
+
+    @action(detail=True, methods=["get"])
+    def impact(self, request, pk=None):
+        return Response(frame_impact(_get_revision(pk)))
+
+
+class FrameIssueResolveView(viewsets.ViewSet):
+    """POST /frame-issues/{id}/resolve/ — documented human resolution."""
+
+    def resolve(self, request, pk=None):
+        from django.shortcuts import get_object_or_404
+        issue = get_object_or_404(FrameRevisionIssue, pk=pk)
+        ser = FrameRevisionIssueResolveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            issue = resolve_issue(issue,
+                                  ser.validated_data["resolution_note"])
+        except FrameWorkflowError as exc:
+            return _frame_error_response(exc)
+        revision = (PlotFrameRevision.objects.prefetch_related("issues")
+                    .get(pk=issue.revision_id))
+        return Response(PlotFrameRevisionSerializer(revision).data)
