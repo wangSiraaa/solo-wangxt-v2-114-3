@@ -15,5 +15,8 @@ router.register("measurements", views.MeasurementViewSet,
 router.register("conflicts", views.ConflictViewSet, basename="conflict")
 router.register("imports", views.ImportViewSet, basename="import")
 router.register("estimates", views.EstimateViewSet, basename="estimate")
+router.register("frames", views.SamplingFrameViewSet, basename="frame")
+router.register("plot-revisions", views.PlotFrameRevisionViewSet,
+                basename="plot-revision")
 
 urlpatterns = [path("", include(router.urls))]

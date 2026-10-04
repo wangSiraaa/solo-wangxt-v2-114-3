@@ -4,8 +4,9 @@ import PlotMap from "./components/PlotMap.jsx";
 import PlotDetail from "./components/PlotDetail.jsx";
 import ConflictsWorkbench from "./components/ConflictsWorkbench.jsx";
 import EstimatePanel from "./components/EstimatePanel.jsx";
+import FrameRevisions from "./components/FrameRevisions.jsx";
 
-const TABS = ["map", "conflicts", "estimates"];
+const TABS = ["map", "frame", "conflicts", "estimates"];
 
 export default function App() {
   const [tab, setTab] = useState("map");
@@ -17,10 +18,15 @@ export default function App() {
   const [m2, setM2] = useState([]);
   const [selectedPlot, setSelectedPlot] = useState(null);
   const [conflicts, setConflicts] = useState([]);
+  const [frameVersion, setFrameVersion] = useState(null);
   const [error, setError] = useState("");
 
   async function refreshConflicts() {
     setConflicts(await api.conflicts("open"));
+  }
+
+  async function refreshFrame() {
+    setFrameVersion(await api.latestFrame());
   }
 
   useEffect(() => {
@@ -35,7 +41,10 @@ export default function App() {
           setT1(ordered[0].code);
           setT2(ordered[ordered.length - 1].code);
         }
-        setConflicts(await api.conflicts("open"));
+        const [openConflicts, frame] = await Promise.all([
+          api.conflicts("open"), api.latestFrame()]);
+        setConflicts(openConflicts);
+        setFrameVersion(frame);
       } catch (e) {
         setError(e.message);
       }
@@ -54,8 +63,9 @@ export default function App() {
 
   const ctx = useMemo(() => ({
     plots, campaigns, t1, t2, m1, m2, conflicts,
+    frameVersion, refreshFrame,
     setSelectedPlot, refreshConflicts,
-  }), [plots, campaigns, t1, t2, m1, m2, conflicts]);
+  }), [plots, campaigns, t1, t2, m1, m2, conflicts, frameVersion]);
 
   return (
     <div className="app">
@@ -67,6 +77,9 @@ export default function App() {
               {c.code} · {c.measured_on}
             </span>
           ))}
+          <span className="chip ok-chip">
+            sampling frame v{frameVersion?.version ?? "–"}
+          </span>
           <span className="chip warn-chip">
             {conflicts.length} open identity conflict
             {conflicts.length === 1 ? "" : "s"}
@@ -81,6 +94,7 @@ export default function App() {
           <button key={t} className={tab === t ? "tab active" : "tab"}
                   onClick={() => setTab(t)}>
             {t === "map" ? "Plots & individuals"
+              : t === "frame" ? "Frame revisions"
               : t === "conflicts" ? `Identity conflicts (${conflicts.length})`
               : "Estimates"}
           </button>
@@ -93,6 +107,9 @@ export default function App() {
             ? <PlotDetail plotCode={selectedPlot} ctx={ctx}
                           onBack={() => setSelectedPlot(null)} />
             : <PlotMap ctx={ctx} onSelect={setSelectedPlot} />
+        )}
+        {tab === "frame" && (
+          <FrameRevisions ctx={ctx} onSelectPlot={setSelectedPlot} />
         )}
         {tab === "conflicts" && (
           <ConflictsWorkbench ctx={ctx}

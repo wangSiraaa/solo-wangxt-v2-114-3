@@ -57,15 +57,22 @@ def convert_height_to_m(raw, unit):
 
 
 def ring_area_ha(ring):
-    """Shoelace area of a projected ring [m] -> hectares."""
+    """Shoelace area of a projected ring [m] -> hectares.
+
+    Coordinates are shifted to the first vertex before summing: UTM metres
+    (~5e5 x, ~4e6 y) otherwise cause catastrophic float cancellation in the
+    cross products (the two ~1e13 sums differ by only ~1e4), which can
+    corrupt the area by orders of magnitude for otherwise-valid polygons.
+    """
     import numpy as np
 
     pts = np.asarray(ring, dtype=float)
     if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3:
         raise ValidationError("boundary needs at least 3 [x, y] vertices.")
+    shifted = pts - pts[0]
     area_m2 = 0.5 * abs(
-        np.dot(pts[:, 0], np.roll(pts[:, 1], -1))
-        - np.dot(pts[:, 1], np.roll(pts[:, 0], -1))
+        np.dot(shifted[:, 0], np.roll(shifted[:, 1], -1))
+        - np.dot(shifted[:, 1], np.roll(shifted[:, 0], -1))
     )
     return area_m2 / 10000.0
 

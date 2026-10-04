@@ -4,8 +4,11 @@ from inventory.models import (
     AllometricEquation,
     Campaign,
     EstimateVersion,
+    FrameIssue,
     IdentityConflict,
     Plot,
+    PlotFrameRevision,
+    SamplingFrameVersion,
     Species,
     Stratum,
     Tree,
@@ -109,17 +112,91 @@ class ConflictResolveSerializer(serializers.Serializer):
 
 
 class EstimateVersionSerializer(serializers.ModelSerializer):
+    frame_version = serializers.IntegerField(
+        source="frame.version", read_only=True, allow_null=True)
+
     class Meta:
         model = EstimateVersion
         fields = [
-            "id", "label", "t1_campaign", "t2_campaign", "status",
+            "id", "label", "frame", "frame_version", "t1_campaign",
+            "t2_campaign", "status",
             "design_snapshot", "result_payload", "equation_checksum",
             "created_at", "confirmed_at",
         ]
         read_only_fields = [
-            "status", "design_snapshot", "result_payload",
+            "status", "frame", "design_snapshot", "result_payload",
             "equation_checksum", "confirmed_at",
         ]
+
+
+class FrameIssueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FrameIssue
+        fields = [
+            "id", "kind", "status", "detail", "payload", "fingerprint",
+            "resolution_note", "created_at", "resolved_at",
+        ]
+
+
+class PlotFrameRevisionSerializer(serializers.ModelSerializer):
+    plot_code = serializers.CharField(source="plot.code", read_only=True)
+    emitted_frame_version = serializers.IntegerField(
+        source="emitted_frame.version", read_only=True, allow_null=True)
+    issues = FrameIssueSerializer(many=True, read_only=True)
+    open_issue_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PlotFrameRevision
+        fields = [
+            "id", "plot", "plot_code", "revision_no", "status",
+            "original_boundary", "original_declared_area_ha",
+            "original_area_polygon_ha", "original_crs_epsg",
+            "boundary", "declared_area_ha", "area_polygon_ha",
+            "crs_epsg", "crs_note", "area_tolerance", "area_check",
+            "content_checksum", "reason",
+            "emitted_frame", "emitted_frame_version", "supersedes",
+            "created_at", "reviewed_at", "published_at",
+            "issues", "open_issue_count",
+        ]
+
+    def get_open_issue_count(self, obj):
+        return sum(1 for i in obj.issues.all() if i.status == "open")
+
+
+class SamplingFrameVersionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SamplingFrameVersion
+        fields = [
+            "id", "version", "source", "source_revision", "plot_payload",
+            "note", "created_at",
+        ]
+
+
+class FrameRevisionCreateSerializer(serializers.Serializer):
+    boundary = serializers.ListField(
+        child=serializers.ListField(
+            child=serializers.FloatField(), min_length=2, max_length=2))
+    declared_area_ha = serializers.FloatField()
+    crs_epsg = serializers.IntegerField()
+    crs_note = serializers.CharField(
+        required=False, allow_blank=True, default="")
+    reason = serializers.CharField(
+        required=False, allow_blank=True, default="")
+
+
+class FrameRevisionRevalidateSerializer(serializers.Serializer):
+    boundary = serializers.ListField(
+        required=False,
+        child=serializers.ListField(
+            child=serializers.FloatField(), min_length=2, max_length=2))
+    declared_area_ha = serializers.FloatField(required=False)
+    crs_epsg = serializers.IntegerField(required=False)
+    crs_note = serializers.CharField(
+        required=False, allow_blank=True)
+
+
+class FrameRevisionPublishSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True)
 
 
 class MeasurementImportRowSerializer(serializers.Serializer):

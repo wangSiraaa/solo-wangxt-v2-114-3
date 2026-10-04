@@ -6,14 +6,27 @@ GET  /trees/?campaign=CODE          individuals and remeasurement status
 GET  /conflicts/                    same-number position contradictions
 POST /conflicts/{id}/resolve/       human verification only
 POST /imports/                      ingest a campaign's field rows
-POST /estimates/                    run (or rerun) a DRAFT estimate
+POST /estimates/                    run a DRAFT bound to a frame version
 POST /estimates/{id}/confirm/       freeze forever; locks equations
 GET  /estimates/{id}/               frozen result with provenance
+
+Sampling-frame revision workflow (a new boundary never rewrites the frame):
+GET  /frames/                       published sampling-frame versions
+GET  /frames/latest/                newest frame + per-plot boundary/area
+GET  /plot-revisions/               revision list (filter ?plot=CODE)
+POST /plot-revisions/               propose draft (idempotent re-upload)
+GET  /plot-revisions/{id}/          revision with pending items
+POST /plot-revisions/{id}/revalidate/  re-check / replace geometry
+POST /plot-revisions/{id}/review/      draft(clean) -> reviewed
+POST /plot-revisions/{id}/publish/  reviewed -> published + new frame v
+GET  /plot-revisions/{id}/compare/  old vs new boundary / area / stems
+GET  /plot-revisions/{id}/impact/   affected individuals + estimate binding
 """
 import hashlib
 
 from django.conf import settings
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -28,6 +41,8 @@ from inventory.models import (
     EstimateVersion,
     IdentityConflict,
     Plot,
+    PlotFrameRevision,
+    SamplingFrameVersion,
     Species,
     Stratum,
     Tree,
@@ -40,9 +55,14 @@ from inventory.serializers import (
     ConflictSerializer,
     EquationSerializer,
     EstimateVersionSerializer,
+    FrameRevisionCreateSerializer,
+    FrameRevisionPublishSerializer,
+    FrameRevisionRevalidateSerializer,
     MeasurementImportSerializer,
     MeasurementSerializer,
+    PlotFrameRevisionSerializer,
     PlotSerializer,
+    SamplingFrameVersionSerializer,
     SpeciesSerializer,
     StratumSerializer,
     TreeSerializer,
@@ -54,6 +74,7 @@ from inventory.services.estimator import (
     equation_checksum,
     resolved_identity_pairs,
 )
+from inventory.services import frame as frame_service
 from inventory.services.ingest import import_campaign_rows
 
 
@@ -191,8 +212,10 @@ class EstimateViewSet(viewsets.ViewSet):
     def create(self, request):
         """
         Body: {"label": ..., "t1_campaign": CODE, "t2_campaign": CODE,
-               "equation_ids": [...], "fpc": true}
-        Creates (or recomputes) a DRAFT. Confirmation is a separate action.
+               "equation_ids": [...], "fpc": true,
+               "frame_version": <int, default latest>}
+        Creates (or recomputes) a DRAFT bound EXPLICITLY to one published
+        sampling-frame version. Confirmation is a separate action.
         """
         label = request.data.get("label", "draft estimate")
         t1 = Campaign.objects.filter(
@@ -211,8 +234,25 @@ class EstimateViewSet(viewsets.ViewSet):
             return Response({"detail": "equation_ids invalid/empty"},
                             status=status.HTTP_400_BAD_REQUEST)
 
+        # Explicit frame binding: default to the latest published frame.
+        frame_version_param = request.data.get("frame_version", "latest")
+        frame = frame_service.ensure_baseline_frame(settings.SURVEY_CRS_EPSG)
+        if frame_version_param != "latest":
+            try:
+                fv = int(frame_version_param)
+            except (TypeError, ValueError):
+                return Response({"detail": "frame_version must be an int"},
+                                status=status.HTTP_400_BAD_REQUEST)
+            frame = SamplingFrameVersion.objects.filter(version=fv).first()
+            if frame is None:
+                return Response(
+                    {"detail": f"unknown sampling frame version {fv}"},
+                    status=status.HTTP_404_NOT_FOUND)
+        else:
+            frame = frame_service.latest_frame() or frame
+
         table_t1, table_t2, equations, plots, strata = (
-            build_measurement_table(t1, t2, equations_qs)
+            build_measurement_table(t1, t2, equations_qs, frame=frame)
         )
         uncovered = sorted({
             r["species"] for r in table_t1 + table_t2
@@ -231,6 +271,7 @@ class EstimateViewSet(viewsets.ViewSet):
             "recruitment_cm": settings.RECRUITMENT_DBH_CM,
             "fpc": bool(request.data.get("fpc", True)),
             "crs_epsg": settings.SURVEY_CRS_EPSG,
+            "frame_version": frame.version,
         }
         result = estimate(table_t1, table_t2, equations, plots, strata,
                           design,
@@ -243,13 +284,18 @@ class EstimateViewSet(viewsets.ViewSet):
                        for code, s in strata.items()}
         design_snapshot = {**design,
                            "strata": snap_strata,
+                           "plot_areas": {code: info["area_ha"]
+                                          for code, info in plots.items()},
+                           "plot_frame_revisions": {
+                               code: info.get("frame_revision_id")
+                               for code, info in plots.items()},
                            "equation_ids": sorted(eq_ids),
                            "equation_codes": {sp: e["code"] + "@" + e["version"]
                                               for sp, e in equations.items()},
                            "area_tolerance": settings.PLOT_AREA_TOLERANCE}
 
         version = EstimateVersion.objects.create(
-            label=label, t1_campaign=t1, t2_campaign=t2,
+            label=label, frame=frame, t1_campaign=t1, t2_campaign=t2,
             design_snapshot=design_snapshot,
             result_payload=result, equation_checksum=checksum,
         )
@@ -298,6 +344,152 @@ class EstimateViewSet(viewsets.ViewSet):
 
 
 def _get_version(pk):
-    from django.shortcuts import get_object_or_404
     return get_object_or_404(
         EstimateVersion.objects.prefetch_related("equations"), pk=pk)
+
+
+class SamplingFrameViewSet(viewsets.ReadOnlyModelViewSet):
+    """Published, append-only sampling-frame versions."""
+
+    serializer_class = SamplingFrameVersionSerializer
+
+    def get_queryset(self):
+        # Listing frames implicitly materialises the baseline snapshot.
+        frame_service.ensure_baseline_frame(settings.SURVEY_CRS_EPSG)
+        return SamplingFrameVersion.objects.all().order_by("-version")
+
+    @action(detail=False, methods=["get"], url_path="latest")
+    def latest(self, request):
+        frame = frame_service.latest_frame() or \
+            frame_service.ensure_baseline_frame(settings.SURVEY_CRS_EPSG)
+        return Response(SamplingFrameVersionSerializer(frame).data)
+
+
+class PlotFrameRevisionViewSet(viewsets.ViewSet):
+    """
+    Plot sampling-frame revision workflow.
+
+    draft -> reviewed -> published, with `blocked` whenever open pending
+    items exist. Historical measurements are never rewritten; estimates
+    bind explicitly to emitted frame versions.
+    """
+
+    def _get_revision(self, pk):
+        return get_object_or_404(
+            PlotFrameRevision.objects.select_related(
+                "plot", "plot__stratum", "emitted_frame").prefetch_related(
+                    "issues"), pk=pk)
+
+    def list(self, request):
+        qs = (
+            PlotFrameRevision.objects
+            .select_related("plot", "emitted_frame")
+            .prefetch_related("issues")
+            .order_by("plot__code", "-revision_no"))
+        plot_code = request.query_params.get("plot")
+        if plot_code:
+            qs = qs.filter(plot__code=plot_code)
+        state = request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        return Response(PlotFrameRevisionSerializer(qs, many=True).data)
+
+    def retrieve(self, request, pk=None):
+        return Response(
+            PlotFrameRevisionSerializer(self._get_revision(pk)).data)
+
+    def create(self, request):
+        plot = Plot.objects.filter(
+            code=request.data.get("plot")).first()
+        if plot is None:
+            return Response({"detail": "unknown plot"},
+                            status=status.HTTP_404_NOT_FOUND)
+        ser = FrameRevisionCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        try:
+            revision, created = frame_service.create_revision(
+                plot,
+                boundary=data["boundary"],
+                declared_area_ha=data["declared_area_ha"],
+                crs_epsg=data["crs_epsg"],
+                tolerance=settings.PLOT_AREA_TOLERANCE,
+                crs_note=data.get("crs_note", ""),
+                reason=data.get("reason", ""))
+        except frame_service.FrameRevisionError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        except frame_service.FrameRevisionConflict as exc:
+            return Response(
+                {"detail": str(exc),
+                 "existing_revision_id": (
+                     PlotFrameRevision.objects.filter(
+                         plot=plot).exclude(status="published")
+                     .order_by("-revision_no").values_list("id", flat=True)
+                     .first())},
+                status=status.HTTP_409_CONFLICT)
+        code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(
+            PlotFrameRevisionSerializer(self._get_revision(revision.id)).data,
+            status=code,
+            headers={"X-Idempotent-Replay": "true" if not created else "false"})
+
+    @action(detail=True, methods=["post"])
+    def revalidate(self, request, pk=None):
+        revision = self._get_revision(pk)
+        ser = FrameRevisionRevalidateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        updates = {k: v for k, v in ser.validated_data.items() if v is not None}
+        try:
+            revision = frame_service.revalidate_revision(
+                revision, settings.PLOT_AREA_TOLERANCE, updates=updates)
+        except frame_service.FrameRevisionConflict as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        except frame_service.FrameRevisionError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            PlotFrameRevisionSerializer(self._get_revision(revision.id)).data)
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        revision = self._get_revision(pk)
+        reason = request.data.get("reason", "")
+        try:
+            revision = frame_service.review_revision(revision, reason=reason)
+        except frame_service.FrameRevisionConflict as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        return Response(
+            PlotFrameRevisionSerializer(self._get_revision(revision.id)).data)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        revision = self._get_revision(pk)
+        ser = FrameRevisionPublishSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            revision, new_frame = frame_service.publish_revision(
+                revision, reason=ser.validated_data.get("reason", ""))
+        except frame_service.FrameRevisionError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        except frame_service.FrameRevisionConflict as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        payload = PlotFrameRevisionSerializer(
+            self._get_revision(revision.id)).data
+        payload["emitted_frame"] = SamplingFrameVersionSerializer(
+            new_frame).data
+        return Response(payload)
+
+    @action(detail=True, methods=["get"])
+    def compare(self, request, pk=None):
+        revision = self._get_revision(pk)
+        return Response(frame_service.revision_comparison(revision))
+
+    @action(detail=True, methods=["get"])
+    def impact(self, request, pk=None):
+        revision = self._get_revision(pk)
+        return Response(frame_service.revision_impact(revision))

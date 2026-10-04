@@ -69,6 +69,48 @@ VERSION_STATUS_CHOICES = [
     (VERSION_SUPERSEDED, "Superseded by a newer confirmed version"),
 ]
 
+# ---------------------------------------------------------------------------
+# Sampling-frame revision lifecycle.
+#
+# A re-surveyed plot boundary must NEVER silently rewrite the published
+# sampling frame: every boundary / area / CRS statement becomes an immutable
+# revision moving draft -> reviewed -> published (or blocked by open pending
+# items). Historical TreeMeasurement rows stay bound to the boundary in force
+# when they were collected; a new boundary can never migrate, delete or
+# rewrite them. Estimates bind explicitly to one published SamplingFrameVersion.
+REVISION_DRAFT = "draft"
+REVISION_REVIEWED = "reviewed"
+REVISION_PUBLISHED = "published"
+REVISION_BLOCKED = "blocked"
+REVISION_STATUS_CHOICES = [
+    (REVISION_DRAFT, "Draft"),
+    (REVISION_REVIEWED, "Reviewed — ready to publish"),
+    (REVISION_PUBLISHED, "Published — a new sampling frame version"),
+    (REVISION_BLOCKED, "Blocked by unresolved pending items"),
+]
+
+ISSUE_AREA_MISMATCH = "area_mismatch"
+ISSUE_TREE_EXCLUDED = "tree_excluded"
+ISSUE_OVERLAP = "overlap"
+FRAME_ISSUE_KIND_CHOICES = [
+    (ISSUE_AREA_MISMATCH, "Declared area outside tolerance of polygon area"),
+    (ISSUE_TREE_EXCLUDED, "New boundary excludes an existing stem position"),
+    (ISSUE_OVERLAP, "Boundary overlaps a same-stratum neighbour plot"),
+]
+ISSUE_OPEN = "open"
+ISSUE_RESOLVED = "resolved"
+FRAME_ISSUE_STATUS_CHOICES = [
+    (ISSUE_OPEN, "Open — blocks publication"),
+    (ISSUE_RESOLVED, "Resolved by a later validation"),
+]
+
+FRAME_SOURCE_BASELINE = "baseline"
+FRAME_SOURCE_REVISION = "plot_revision"
+FRAME_SOURCE_CHOICES = [
+    (FRAME_SOURCE_BASELINE, "Baseline frame from the original survey polygons"),
+    (FRAME_SOURCE_REVISION, "Emitted by publishing a plot frame revision"),
+]
+
 
 class Stratum(models.Model):
     """Sampling stratum with known land area (the sampling frame)."""
@@ -355,6 +397,15 @@ class EstimateVersion(models.Model):
     """
 
     label = models.CharField(max_length=120)
+    frame = models.ForeignKey(
+        "SamplingFrameVersion",
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="estimates",
+        help_text="The published sampling-frame version (plot boundaries and "
+                  "areas) this estimate is computed against. Explicit, never "
+                  "silently switched by a later boundary revision.",
+    )
     t1_campaign = models.ForeignKey(
         Campaign, on_delete=models.PROTECT, related_name="estimate_t1"
     )
@@ -392,3 +443,211 @@ class EstimateVersion(models.Model):
 
     def __str__(self):
         return f"{self.label} [{self.status}]"
+
+
+class SamplingFrameVersion(models.Model):
+    """
+    An immutable edition of the sampling frame.
+
+    Version 1 is the *baseline* frame built from the originally surveyed
+    polygons; each later version is emitted atomically when a PlotFrameRevision
+    is published. Plots not affected by that revision keep the same boundary
+    payload (carried verbatim), so a frame version is a self-contained snapshot
+    of every plot's boundary, declared and polygon area and CRS.
+
+    Frame versions are append-only: once published they are frozen and can
+    never be rewritten. Estimates bind to one by FK and therefore remain
+    reproducible even after later revisions publish.
+    """
+
+    version = models.PositiveIntegerField(unique=True)
+    source_revision = models.ForeignKey(
+        "PlotFrameRevision",
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="emitted_frames",
+        help_text="Null for the baseline frame; the revision that emitted it.",
+    )
+    source = models.CharField(
+        max_length=16, choices=FRAME_SOURCE_CHOICES,
+        default=FRAME_SOURCE_REVISION,
+    )
+    # {plot_code: {"stratum", "boundary", "declared_area_ha",
+    #              "area_polygon_ha", "crs_epsg", "x_m", "y_m",
+    #              "revision_id" | null}}
+    plot_payload = models.JSONField()
+    note = models.CharField(max_length=400, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["version"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise PermissionError(
+                "SamplingFrameVersion is append-only and immutable; publish a "
+                "new revision instead of editing this frame version."
+            )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            "SamplingFrameVersion is append-only and cannot be deleted.")
+
+    def __str__(self):
+        return f"frame v{self.version}"
+
+
+class PlotFrameRevision(models.Model):
+    """
+    A proposed revision of ONE plot's boundary / declared area / CRS note.
+
+    The original boundary and area are snapshotted at creation
+    (original_* columns), so the history is never lost. The revision carries
+    the area cross-check result and, on publication, the human-given reason.
+
+    Lifecycle: draft -> reviewed -> published. Validations that fail (new
+    boundary excludes existing stems, polygon/declared area beyond tolerance,
+    overlap with a same-stratum neighbour) open FrameIssue rows and force the
+    revision into `blocked`; publication is impossible until re-validation is
+    clean (back to draft, then review, then publish). Historical
+    TreeMeasurement rows are NEVER moved, deleted or rewritten by a revision;
+    they are only listed as affected pending items.
+
+    Published rows are immutable; every later change is a NEW revision row.
+    """
+
+    plot = models.ForeignKey(
+        Plot, on_delete=models.PROTECT, related_name="frame_revisions"
+    )
+    revision_no = models.PositiveIntegerField(
+        help_text="1-based revision sequence within the plot.")
+    status = models.CharField(
+        max_length=10, choices=REVISION_STATUS_CHOICES, default=REVISION_DRAFT
+    )
+
+    # The ORIGINAL geometry in force when the revision was proposed (kept
+    # forever; a revision never destructively replaces the Plot row).
+    original_boundary = models.JSONField()
+    original_declared_area_ha = models.FloatField()
+    original_area_polygon_ha = models.FloatField()
+    original_crs_epsg = models.PositiveIntegerField()
+
+    # The proposed geometry / area statement / CRS note.
+    boundary = models.JSONField()
+    declared_area_ha = models.FloatField()
+    area_polygon_ha = models.FloatField(
+        help_text="Polygon area computed at creation; cross-check result is "
+                  "carried in the area_check payload."
+    )
+    crs_epsg = models.PositiveIntegerField(
+        help_text="CRS of the proposed boundary coordinates, stated "
+                  "explicitly with every revision.")
+    crs_note = models.CharField(
+        max_length=300, blank=True,
+        help_text="Free-text CRS statement (datum, zone, source survey).")
+
+    area_tolerance = models.FloatField(
+        help_text="Relative tolerance used for the declared/polygon check.")
+    area_check = models.JSONField(
+        help_text='{"relative_error", "within_tolerance", "detail"}')
+    content_checksum = models.CharField(
+        max_length=64,
+        help_text="SHA-256 of boundary+area+CRS — idempotent re-upload key.")
+
+    reason = models.CharField(
+        max_length=400, blank=True,
+        help_text="Human-given reason; mandatory before publication.")
+    emitted_frame = models.ForeignKey(
+        SamplingFrameVersion, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="plot_revisions",
+    )
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="superseded_by",
+        help_text="The previously published revision (null = original survey).",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["plot__code", "revision_no"]
+        unique_together = [("plot", "revision_no")]
+        constraints = [
+            # Exactly one OPEN (draft/reviewed/blocked) revision per plot:
+            # a blocked geometry must be re-validated in place, so competing
+            # proposals can never pile up and compete at publication.
+            models.UniqueConstraint(
+                fields=["plot"],
+                condition=~models.Q(status=REVISION_PUBLISHED),
+                name="uniq_one_open_revision_per_plot",
+            ),
+        ]
+
+    _FROZEN_STATUSES = (REVISION_PUBLISHED,)
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            original = type(self).objects.get(pk=self.pk)
+            if original.status == REVISION_PUBLISHED:
+                frozen = [
+                    "boundary", "declared_area_ha", "area_polygon_ha",
+                    "crs_epsg", "crs_note", "area_tolerance", "area_check",
+                    "content_checksum", "original_boundary",
+                    "original_declared_area_ha", "original_area_polygon_ha",
+                    "original_crs_epsg", "plot_id", "revision_no",
+                ]
+                changed = [f for f in frozen
+                           if getattr(original, f) != getattr(self, f)]
+                if changed:
+                    raise PermissionError(
+                        f"PlotFrameRevision {self.plot.code} #"
+                        f"{self.revision_no} is published; its boundary is "
+                        f"frozen. Changed: {changed}. Propose a new revision.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.status == REVISION_PUBLISHED:
+            raise PermissionError("published frame revisions cannot be deleted")
+        super().delete(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.plot.code} revision #{self.revision_no} [{self.status}]"
+
+
+class FrameIssue(models.Model):
+    """
+    A pending item raised while validating a PlotFrameRevision.
+
+    Open issues force the revision into `blocked` and make publishing
+    impossible; the geometry is never silently accepted and estimates are
+    never computed from it. Issues are resolved only by re-validating a
+    geometry on which the condition no longer holds (never hand-waved away),
+    and the row is retained for the audit trail.
+    """
+
+    revision = models.ForeignKey(
+        PlotFrameRevision, on_delete=models.PROTECT, related_name="issues"
+    )
+    kind = models.CharField(max_length=20, choices=FRAME_ISSUE_KIND_CHOICES)
+    status = models.CharField(
+        max_length=10, choices=FRAME_ISSUE_STATUS_CHOICES, default=ISSUE_OPEN
+    )
+    detail = models.CharField(max_length=600)
+    payload = models.JSONField(
+        default=dict, blank=True,
+        help_text="Machine-readable detail: excluded stems, overlap area, "
+                  "areas, etc.",
+    )
+    fingerprint = models.CharField(
+        max_length=64,
+        help_text="Stable hash of kind+payload so re-validation reuses rows.")
+    resolution_note = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["revision__plot__code", "revision__revision_no", "id"]
+        unique_together = [("revision", "fingerprint")]

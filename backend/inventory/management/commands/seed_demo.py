@@ -163,10 +163,13 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         from inventory.models import (
-            EstimateVersion, IdentityConflict, MeasurementImportRow,
+            EstimateVersion, FrameIssue, IdentityConflict,
+            MeasurementImportRow, PlotFrameRevision, SamplingFrameVersion,
             Tree, TreeMeasurement,
         )
-        models = [EstimateVersion, IdentityConflict, MeasurementImportRow,
+        # Dependent (revision/frame) rows first: they PROTECT plots.
+        models = [EstimateVersion, FrameIssue, PlotFrameRevision,
+                  SamplingFrameVersion, IdentityConflict, MeasurementImportRow,
                   TreeMeasurement, Tree, Plot, Campaign,
                   AllometricEquation, Species, Stratum]
         for m in models:
@@ -303,5 +306,45 @@ class Command(BaseCommand):
                 f"  {f['plot']}/{f['field_number']} -> "
                 f"{f.get('t2_field_number')} d={f['distance_m']}m "
                 f"[{f['hint']}]")
+
+        # ---- sampling-frame revision demo scenarios ---------------------
+        # P03 re-survey cleanly expands 0.20 -> 0.25 ha (every historical
+        # stem stays inside): drafts -> reviewed -> PUBLISHED as frame v2.
+        # P01's proposed boundary clips away its east strip and excludes
+        # historical stems (005/006/201/202): it stays BLOCKED with pending
+        # items and no frame version is emitted.
+        from inventory.services import frame as frame_service
+        p03 = plot_objs["P03"]
+        p03_ring = rect(PLOTS["P03"]["ox"], PLOTS["P03"]["oy"], 50, 50)
+        rev03, created03 = frame_service.create_revision(
+            p03, p03_ring, declared_area_ha=0.25,
+            crs_epsg=settings.SURVEY_CRS_EPSG,
+            tolerance=settings.PLOT_AREA_TOLERANCE,
+            crs_note="FICTIONAL 2026 differential-GPS re-survey",
+            reason="north boundary monument relocated; area 0.20->0.25 ha")
+        if rev03.status == "draft":
+            frame_service.review_revision(rev03)
+            rev03, f03 = frame_service.publish_revision(
+                rev03, reason="north boundary monument relocated; "
+                              "area 0.20->0.25 ha")
+            self.stdout.write(
+                f"frame revision P03 #{rev03.revision_no} published -> "
+                f"frame v{f03.version}")
+        else:
+            self.stdout.write(
+                f"P03 revision blocked: "
+                f"{[i.kind for i in rev03.issues.filter(status='open')]}")
+
+        p01 = plot_objs["P01"]
+        p01_ring = rect(PLOTS["P01"]["ox"], PLOTS["P01"]["oy"], 70, 50)
+        rev01, _ = frame_service.create_revision(
+            p01, p01_ring, declared_area_ha=0.35,
+            crs_epsg=settings.SURVEY_CRS_EPSG,
+            tolerance=settings.PLOT_AREA_TOLERANCE,
+            crs_note="FICTIONAL 2026 disputed east boundary",
+            reason="proposed east trim (rejected: historical stems excluded)")
+        self.stdout.write(
+            f"frame revision P01 #{rev01.revision_no} [{rev01.status}]: "
+            f"{[i.kind for i in rev01.issues.filter(status='open')]}")
 
         self.stdout.write(self.style.SUCCESS("seed complete"))

@@ -61,8 +61,16 @@ def biomass_measurement_variance(agb, dbh_cm, height_m, eq,
 
 
 # --------------------------------------------------------------- table build
-def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
-    """Returns (table_rows, equations_by_species, plots, strata)."""
+def build_measurement_table(t1_campaign, t2_campaign, equations_qs, frame=None):
+    """Returns (table_rows, equations_by_species, plots, strata).
+
+    When ``frame`` (a SamplingFrameVersion) is given, each plot's area and
+    boundary come from that frozen frame payload, so an estimate is
+    reproducibly bound to one sampling-frame edition: later boundary
+    revisions cannot silently change its per-hectare expansion. Trees are
+    always read from their historical TreeMeasurement rows — a new frame
+    never migrates a measurement.
+    """
     equations = {}
     for e in equations_qs:
         for sp in e.species.all():
@@ -84,10 +92,18 @@ def build_measurement_table(t1_campaign, t2_campaign, equations_qs):
         strata[s.code] = {"code": s.code, "name": s.name,
                           "area_ha": s.area_ha, "plot_codes": []}
     for p in Plot.objects.select_related("stratum"):
+        entry = None
+        if frame is not None:
+            entry = frame.plot_payload.get(p.code)
         plots[p.code] = {
             "code": p.code,
             "stratum": p.stratum.code,
-            "area_ha": p.declared_area_ha,
+            "area_ha": (entry["declared_area_ha"] if entry
+                        else p.declared_area_ha),
+            "polygon_area_ha": (entry["area_polygon_ha"] if entry
+                                else p.area_polygon_ha),
+            "frame_revision_id": (entry.get("revision_id") if entry
+                                  else None),
             "x_m": p.x_m, "y_m": p.y_m,
         }
         strata[p.stratum.code]["plot_codes"].append(p.code)
@@ -160,6 +176,7 @@ class PlotComponents:
     code: str
     stratum: str
     area_ha: float
+    frame_revision_id: object = None
     survivor_kg: float = 0.0
     survivor_var_meas_kg2: float = 0.0
     survivor_observed_pairs: int = 0
@@ -210,7 +227,8 @@ def compute_plot_components(plot_code, plot_info, pairing, equations,
                             dbh_sd_cm, height_sd_m, zero_tol_cm,
                             recruitment_cm, interval_years):
     pc = PlotComponents(code=plot_code, stratum=plot_info["stratum"],
-                        area_ha=plot_info["area_ha"])
+                        area_ha=plot_info["area_ha"],
+                        frame_revision_id=plot_info.get("frame_revision_id"))
 
     def agb(row):
         eq = equations[row["species"]]
@@ -611,6 +629,16 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
                   "dbh": "cm (converted at ingest; raw unit retained)",
                   "height": "m", "area": "hectare",
                   "crs_epsg": design["crs_epsg"]},
+        "sampling_frame": {
+            "version": design.get("frame_version"),
+            "binding": "estimate is bound to this published sampling-frame "
+                       "version; a later boundary revision never changes it",
+            "revised_plots": {
+                code: info.get("frame_revision_id")
+                for code, info in plots.items()
+                if info.get("frame_revision_id") is not None
+            },
+        },
         "design": {
             "estimator": "stratified simple random sampling, per-hectare "
                          "plot values expanded by stratum land area",
@@ -647,6 +675,7 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
 def _pc_provenance(pc):
     return {
         "plot": pc.code, "stratum": pc.stratum, "area_ha": pc.area_ha,
+        "frame_revision_id": pc.frame_revision_id,
         "survivor_observed_pairs": pc.survivor_observed_pairs,
         "verified_zero_growth": pc.survivor_zero_growth,
         "alive_not_measured": pc.survivor_missing,

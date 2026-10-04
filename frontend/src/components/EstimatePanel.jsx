@@ -4,10 +4,12 @@ import { api } from "../api.js";
 function Mg(kg) { return (kg / 1000).toFixed(2); }
 
 export default function EstimatePanel({ ctx }) {
-  const { t1, t2 } = ctx;
+  const { t1, t2, frameVersion } = ctx;
   const [equations, setEquations] = useState([]);
   const [selected, setSelected] = useState([]);
   const [versions, setVersions] = useState([]);
+  const [frames, setFrames] = useState([]);
+  const [chosenFrame, setChosenFrame] = useState("latest");
   const [openId, setOpenId] = useState(null);
   const [detail, setDetail] = useState(null);
   const [err, setErr] = useState("");
@@ -21,6 +23,7 @@ export default function EstimatePanel({ ctx }) {
       setEquations(eq);
       setSelected(eq.map((e) => e.id));
     });
+    api.frames().then((fs) => setFrames(fs.slice().reverse()));
     loadVersions();
   }, []);
 
@@ -36,6 +39,8 @@ export default function EstimatePanel({ ctx }) {
         label: `Draft ${new Date().toISOString().slice(0, 16)}`,
         t1_campaign: t1, t2_campaign: t2,
         equation_ids: selected, fpc: true,
+        frame_version: chosenFrame === "latest" ? "latest"
+                         : Number(chosenFrame),
       });
       await loadVersions();
       setOpenId(d.id);
@@ -60,9 +65,31 @@ export default function EstimatePanel({ ctx }) {
         Per-plot component ÷ each plot's own area → stratum per-hectare mean
         → scaled by known stratum land area. Trees are never pooled, averaged
         and multiplied by area. Δstock = survivor growth − mortality +
-        ingrowth, same allometric equation on both dates.
+        ingrowth, same allometric equation on both dates. Every run binds
+        EXPLICITLY to one published sampling-frame version: a later boundary
+        revision never changes a confirmed estimate — run a new draft against
+        the new frame instead.
       </p>
       {err && <div className="error">{err}</div>}
+
+      <section className="eq-picker">
+        <h3>Sampling frame binding</h3>
+        <label>Frame version for this run:
+          <select value={chosenFrame}
+                  onChange={(e) => setChosenFrame(e.target.value)}>
+            <option value="latest">
+              latest (v{frameVersion?.version ?? "–"})
+            </option>
+            {frames.map((f) => (
+              <option key={f.version} value={f.version}>
+                v{f.version} — {f.source}{f.source_revision
+                  ? ` (revision-driven: ${f.note?.slice(0, 40)})`
+                  : " (baseline)"}
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
 
       <section className="eq-picker">
         <h3>Allometric equations (applicability explicit)</h3>
@@ -97,6 +124,7 @@ export default function EstimatePanel({ ctx }) {
                   onClick={() => setOpenId(v.id)}>
                 <td>#{v.id}</td><td>{v.label}</td>
                 <td className={`status-${v.status}`}>{v.status}</td>
+                <td>frame v{v.frame_version ?? "–"}</td>
                 <td>{v.confirmed_at
                   ? new Date(v.confirmed_at).toLocaleString() : ""}</td>
                 <td onClick={(e) => e.stopPropagation()}>
@@ -218,9 +246,18 @@ function EditionDetail({ v }) {
           </ol>
           <h4>Units &amp; equations recorded</h4>
           <pre>{JSON.stringify({ units: r.units,
+            sampling_frame: r.sampling_frame,
             equations: Object.fromEntries(Object.entries(r.equations_used)
               .map(([sp, e]) => [sp, `${e.code}@${e.version}`])) },
             null, 2)}</pre>
+          {Object.keys(r.sampling_frame?.revised_plots || {}).length > 0 &&
+            <p className="ok">
+              Bound plots revised on this frame:{" "}
+              {Object.entries(r.sampling_frame.revised_plots)
+                .map(([plot, rid]) => `${plot} (revision #${rid})`).join(", ")}
+              . Per-hectare expansion for those plots uses the revised area;
+              older confirmed editions keep their own frozen frame.
+            </p>}
         </div>
       </div>
     </section>

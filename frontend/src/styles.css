@@ -103,3 +103,58 @@ footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
 @media (max-width: 900px) {
   .detail-grid, .two-col { grid-template-columns: 1fr; }
 }
+
+/* ------------------------- sampling-frame revisions -------------------- */
+.ok-chip { background: #e3f2fd !important; color: #0d47a1 !important; }
+.ok-text { color: var(--green); font-weight: 600; }
+.bad-text { color: var(--red); font-weight: 600; }
+.frame-toggle { display: flex; align-items: center; gap: 8px; margin: 10px 0;
+  font-size: 13px; }
+.toggle { border: 1px solid var(--line); background: #fff; border-radius: 14px;
+  padding: 4px 14px; cursor: pointer; font-size: 12px; }
+.toggle.active { background: #e3f2fd; border-color: #1565c0; color: #0d47a1;
+  font-weight: 600; }
+.line-swatch { display: inline-block; width: 22px; height: 0; border-top: 3px
+  solid; margin-right: 4px; vertical-align: middle; border-radius: 2px; }
+.line-swatch.original { border-color: var(--green); border-top-style: dashed; }
+.line-swatch.revised { border-color: #1565c0; }
+.boundary-original { fill: rgba(46,125,50,0.05); stroke: var(--green);
+  stroke-dasharray: 7 4; stroke-width: 2; }
+.boundary-revised { fill: rgba(21,101,192,0.06); stroke: #1565c0;
+  stroke-width: 2.5; }
+.boundary.ghost, .boundary-original.ghost, .boundary-revised.ghost {
+  fill: none; opacity: 0.35; stroke-dasharray: 3 4; }
+.excluded-cross { fill: var(--red); font-size: 13px; font-weight: 800;
+  text-anchor: middle; pointer-events: none; }
+.excluded-marker { color: var(--red); font-weight: 800; }
+.stem-excluded { stroke: var(--red) !important; stroke-width: 2.5; }
+tr.row-excluded { background: #fdecec; }
+.excluded-badge { background: #fdecec; color: var(--red); border-radius: 10px;
+  padding: 1px 8px; font-size: 10px; margin-left: 6px; }
+.frame-controls { display: flex; gap: 12px; align-items: center; margin: 8px 0; }
+.frame-controls select, .revision-form input, .revision-form textarea,
+.revision-form select { width: 100%; padding: 5px 8px; margin: 3px 0;
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12px;
+  font-family: inherit; }
+.revision-form textarea { font-family: monospace; }
+.form-row { display: flex; gap: 12px; }
+.form-row label { flex: 1; }
+.propose-form, .revision-detail, .compare, .impact { background: #fff;
+  border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px;
+  margin-top: 14px; }
+.revision-detail.blocked { border-color: var(--red);
+  box-shadow: 0 0 0 1px #f0c2c2; }
+.revision-detail.reviewed { border-color: var(--green); }
+.area-check { margin: 8px 0; font-size: 13px; }
+.issues { margin: 10px 0; }
+.issue { border-left: 3px solid var(--red); background: #fdecec;
+  padding: 6px 10px; margin: 6px 0; font-size: 12px; border-radius: 4px; }
+.issue.resolved { border-color: var(--green); background: #e7f6e9;
+  color: var(--muted); }
+.issue-status { font-size: 10px; margin-left: 6px; color: var(--muted); }
+.stem-list { margin: 4px 0 4px 18px; font-size: 12px; }
+.workflow-actions { display: flex; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+.workflow-actions button.primary { background: #1565c0; color: #fff;
+  border-color: #1565c0; }
+.selected-row { outline: 2px solid #90caf9; }
+.revision-history { margin-top: 14px; font-size: 12px; }

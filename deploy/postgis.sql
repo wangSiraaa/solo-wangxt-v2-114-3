@@ -159,3 +159,100 @@ DROP TRIGGER IF EXISTS inventory_equation_freeze_trg
 CREATE TRIGGER inventory_equation_freeze_trg
 BEFORE UPDATE ON inventory_allometricequation
 FOR EACH ROW EXECUTE FUNCTION inventory_equation_freeze();
+
+-- =====================================================================
+-- Sampling-frame revisions
+--
+-- A re-surveyed boundary NEVER silently rewrites the published frame:
+-- PlotFrameRevision rows are immutable once published and publish emits an
+-- append-only SamplingFrameVersion. Historical TreeMeasurement rows keep
+-- their coordinates (the stem-in-plot CHECK below references inventory_plot,
+-- which retains the ORIGINAL survey polygon); a revision excludes or
+-- includes nothing in the measurement table, it only raises a pending item.
+-- =====================================================================
+
+-- published plot-frame revisions: geometry/area/CRS frozen, no DELETE
+CREATE OR REPLACE FUNCTION inventory_plot_revision_freeze()
+RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' AND OLD.status = 'published' THEN
+    RAISE EXCEPTION
+      'PlotFrameRevision %/% is published and cannot be deleted.',
+      OLD.plot_id, OLD.revision_no;
+  END IF;
+  IF OLD.status = 'published'
+     AND (NEW.boundary IS DISTINCT FROM OLD.boundary
+          OR NEW.declared_area_ha IS DISTINCT FROM OLD.declared_area_ha
+          OR NEW.area_polygon_ha IS DISTINCT FROM OLD.area_polygon_ha
+          OR NEW.crs_epsg IS DISTINCT FROM OLD.crs_epsg
+          OR NEW.original_boundary IS DISTINCT FROM OLD.original_boundary
+          OR NEW.original_declared_area_ha IS DISTINCT
+             FROM OLD.original_declared_area_ha) THEN
+    RAISE EXCEPTION
+      'PlotFrameRevision %/% is published; propose a new revision instead.',
+      OLD.plot_id, OLD.revision_no;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_plot_revision_freeze_trg
+  ON inventory_plotframerevision;
+CREATE TRIGGER inventory_plot_revision_freeze_trg
+BEFORE UPDATE OR DELETE ON inventory_plotframerevision
+FOR EACH ROW EXECUTE FUNCTION inventory_plot_revision_freeze();
+
+-- only one published revision emits a frame version: frame versions are
+-- append-only and never edited or deleted.
+CREATE OR REPLACE FUNCTION inventory_frame_version_append_only()
+RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    RAISE EXCEPTION
+      'SamplingFrameVersion % is append-only; publish a new revision instead.',
+      OLD.version;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION
+      'SamplingFrameVersion % cannot be deleted.', OLD.version;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_frame_version_append_only_trg
+  ON inventory_samplingframeversion;
+CREATE TRIGGER inventory_frame_version_append_only_trg
+BEFORE UPDATE OR DELETE ON inventory_samplingframeversion
+FOR EACH ROW EXECUTE FUNCTION inventory_frame_version_append_only();
+
+-- a revision cannot be marked published without an emitted frame, and an
+-- emitted frame always points back to a published revision.
+ALTER TABLE inventory_plotframerevision
+  DROP CONSTRAINT IF EXISTS inventory_revision_published_has_frame;
+ALTER TABLE inventory_plotframerevision
+  ADD CONSTRAINT inventory_revision_published_has_frame CHECK (
+    status <> 'published' OR emitted_frame_id IS NOT NULL);
+
+-- open frame issues keep their revision out of publication; the application
+-- moves such a revision to 'blocked' (defence in depth: this CHECK forbids
+-- publishing a revision that still carries an open issue).
+CREATE OR REPLACE FUNCTION inventory_no_open_issues_when_published()
+RETURNS trigger AS $$
+BEGIN
+  IF NEW.status = 'published'
+     AND EXISTS (SELECT 1 FROM inventory_frameissue i
+                  WHERE i.revision_id = NEW.id AND i.status = 'open') THEN
+    RAISE EXCEPTION
+      'PlotFrameRevision %/% still has open pending items; cannot publish.',
+      NEW.plot_id, NEW.revision_no;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inventory_no_open_issues_publish_trg
+  ON inventory_plotframerevision;
+CREATE TRIGGER inventory_no_open_issues_publish_trg
+BEFORE UPDATE OF status ON inventory_plotframerevision
+FOR EACH ROW EXECUTE FUNCTION inventory_no_open_issues_when_published();
